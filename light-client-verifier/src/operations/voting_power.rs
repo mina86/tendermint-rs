@@ -226,6 +226,8 @@ impl NonAbsentCommitVote {
 struct NonAbsentCommitVotes {
     /// Votes sorted by validator address.
     votes: Vec<NonAbsentCommitVote>,
+    /// Internal buffer for storing sign_bytes.
+    sign_bytes: [u8; 256],
 }
 
 impl NonAbsentCommitVotes {
@@ -257,7 +259,7 @@ impl NonAbsentCommitVotes {
                 pair[0].validator_id(),
             ))
         } else {
-            Ok(Self { votes })
+            Ok(Self { votes, sign_bytes: [0; 256] })
         }
     }
 
@@ -279,14 +281,15 @@ impl NonAbsentCommitVotes {
         };
 
         if !vote.verified {
-            let sign_bytes = vote.signed_vote.sign_bytes();
+            let len = vote.signed_vote.sign_bytes_into(&mut self.sign_bytes[..]).unwrap();
+            let sign_bytes = &self.sign_bytes[..len];
             validator
-                .verify_signature::<V>(&sign_bytes, vote.signed_vote.signature())
+                .verify_signature::<V>(sign_bytes, vote.signed_vote.signature())
                 .map_err(|_| {
                     VerificationError::invalid_signature(
                         vote.signed_vote.signature().as_bytes().to_vec(),
                         Box::new(validator.clone()),
-                        sign_bytes,
+                        sign_bytes.to_vec(),
                     )
                 })?;
         }
