@@ -268,22 +268,80 @@ struct NonAbsentCommitVotes {
     ///
     /// The buffer is reused for each canonical vote so that we allocate it
     /// once.
-    sign_bytes: Vec<u8>,
+    sign_bytes: Box<SignBytesBuffer>,
+}
+
+struct SignBytesBuffer {
+    buf: [u8; 128],
+    len: usize,
+    ts_len: usize,
+    ts_pos: usize,
+}
+
+impl Default for SignBytesBuffer {
+    fn default() -> Self {
+        Self {
+            buf: [0; 128],
+            len: 0,
+            ts_len: 0,
+            ts_pos: 0,
+        }
+    }
+}
+
+impl SignBytesBuffer {
+    fn update(&mut self, vote: &tendermint::vote::SignedVote) -> &[u8] {
+        let (ts_buf, ts_len) = Self::encode_timestamp(vote.vote().timestamp);
+        let timestamp = &ts_buf[..ts_len];
+
+        // If we’re uninitialised or don’t know where to put timestamp, encode
+        // the vote and return that.
+        if self.len == 0 || self.ts_pos == 0 {
+            vote.sign_bytes_into(&mut &mut self.buf[..]).unwrap();
+            self.len = 1 + usize::from(self.buf[0]);
+            // Find timestamp inside of the encoded vote so that we can later
+            // replace it.
+            self.ts_pos = if timestamp.is_empty() {
+                0
+            } else {
+                self.buf[..self.len]
+                    .windows(timestamp.len())
+                    .position(|window| window == timestamp)
+                    .expect("to find timestamp")
+            };
+        } else {
+            // self.buf contains previous vote and [ts_pos..(ts_pos+ts_len)]
+            // subslice contains the timestamp.  All we do is replace the
+            // timestamp assuming that no other fields have changed.
+            let end_old = self.ts_pos + self.ts_len;
+            let end_new = self.ts_pos + timestamp.len();
+            self.buf.copy_within(end_old..self.len, end_new);
+            self.buf[self.ts_pos..end_new].copy_from_slice(timestamp);
+            self.len = (self.len as isize - end_old as isize + end_new as isize) as usize;
+        }
+        self.ts_len = timestamp.len();
+        self.buf[0] = (self.len - 1) as u8;
+
+        &self.buf[..self.len]
+    }
+
+    fn encode_timestamp(time: Option<tendermint::time::Time>) -> ([u8; 24], usize) {
+        use prost::Message;
+        let mut buf = [0; 24];
+        let len = time
+            .map(|time| {
+                buf[0] = 42; // tag: 5; wire type: 2 (length-delimited)
+                tendermint_proto::google::protobuf::Timestamp::from(time)
+                    .encode_length_delimited(&mut &mut buf[1..])
+                    .unwrap();
+                usize::from(buf[1]) + 2
+            })
+            .unwrap_or_default();
+        (buf, len)
+    }
 }
 
 impl NonAbsentCommitVotes {
-    /// Initial capacity of the `sign_bytes` buffer.
-    ///
-    /// The buffer will be resized if it happens to be too small so this value
-    /// isn’t critical for correctness.  It’s a matter of performance to avoid
-    /// reallocations.
-    ///
-    /// Note: As of protocol 0.38, maximum length of the sign bytes is `115 + (N
-    /// > 13) + N` where `N` is the length of the chain id.  Chain id can be at
-    /// most 50 bytes (see [`tendermint::chain::id::MAX_LEN`]) thus the largest
-    /// buffer we’ll ever need is 166 bytes long.
-    const SIGN_BYTES_INITIAL_CAPACITY: usize = 166;
-
     pub fn new(signed_header: &SignedHeader) -> Result<Self, VerificationError> {
         let mut votes = signed_header
             .commit
@@ -316,7 +374,7 @@ impl NonAbsentCommitVotes {
         } else {
             Ok(Self {
                 votes,
-                sign_bytes: Vec::with_capacity(Self::SIGN_BYTES_INITIAL_CAPACITY),
+                sign_bytes: Box::new(Default::default()),
             })
         }
     }
@@ -339,11 +397,7 @@ impl NonAbsentCommitVotes {
         };
 
         if !vote.verified {
-            self.sign_bytes.truncate(0);
-            vote.signed_vote
-                .sign_bytes_into(&mut self.sign_bytes)
-                .expect("buffer is resized if needed and encoding never fails");
-            let sign_bytes = self.sign_bytes.as_slice();
+            let sign_bytes = &self.sign_bytes.update(&vote.signed_vote);
             validator
                 .verify_signature::<V>(sign_bytes, vote.signed_vote.signature())
                 .map_err(|_| {
