@@ -265,7 +265,76 @@ struct NonAbsentCommitVotes {
     /// Votes sorted by validator address.
     votes: Vec<NonAbsentCommitVote>,
     /// Internal buffer for storing sign_bytes.
-    sign_bytes: [u8; 256],
+    sign_bytes: SignBytesBuffer,
+}
+
+struct SignBytesBuffer {
+    buf: [u8; 128],
+    len: usize,
+    ts_len: usize,
+    ts_pos: usize,
+}
+
+impl Default for SignBytesBuffer {
+    fn default() -> Self {
+        Self {
+            buf: [0; 128],
+            len: 0,
+            ts_len: 0,
+            ts_pos: 0,
+        }
+    }
+}
+
+impl SignBytesBuffer {
+    fn update(&mut self, vote: &tendermint::vote::SignedVote) -> &[u8] {
+        let (ts_buf, ts_len) = Self::encode_timestamp(vote.vote().timestamp);
+        let timestamp = &ts_buf[..ts_len];
+
+        if self.len == 0 || self.ts_pos == 0 {
+            // If we’re uninitialised or don’t know where to put timestamp,
+            // encode the vote and return that.
+            self.len = vote.sign_bytes_into(&mut self.buf[..]).unwrap();
+            // Find timestamp inside of the encoded vote so that we can later
+            // replace it.
+            self.ts_len = timestamp.len();
+            self.ts_pos = if timestamp.is_empty() {
+                0
+            } else {
+                self.buf[..self.len]
+                    .windows(self.ts_len)
+                    .position(|window| window == timestamp)
+                    .expect("to find timestamp")
+            };
+        } else {
+            // self.buf contains previous vote and [ts_pos..(ts_pos+ts_len)]
+            // subslice contains the timestamp.  All we do is replace the timestamp
+            // assuming that no other fields have changed.
+            let end_old = self.ts_pos + self.ts_len;
+            let end_new = self.ts_pos + timestamp.len();
+            self.buf.copy_within(end_old..self.len, end_new);
+            self.buf[self.ts_pos..end_new].copy_from_slice(timestamp);
+            self.len = (self.len as isize - end_old as isize + end_new as isize) as usize;
+            self.ts_len = timestamp.len();
+        }
+        self.buf[0] = (self.len - 1) as u8;
+
+        &self.buf[..self.len]
+    }
+
+    fn encode_timestamp(time: Option<tendermint::time::Time>) -> ([u8; 24], usize) {
+        use prost::Message;
+        if let Some(time) = time {
+            let mut buf = [0; 24];
+            buf[0] = 42; // tag: 5; wire type: 2 (length-delimited)
+            tendermint_proto::google::protobuf::Timestamp::from(time)
+                .encode_length_delimited(&mut &mut buf[1..])
+                .unwrap();
+            (buf, buf[1] as usize + 2)
+        } else {
+            ([0; 24], 0)
+        }
+    }
 }
 
 impl NonAbsentCommitVotes {
@@ -299,7 +368,10 @@ impl NonAbsentCommitVotes {
                 pair[0].validator_id(),
             ))
         } else {
-            Ok(Self { votes, sign_bytes: [0; 256] })
+            Ok(Self {
+                votes,
+                sign_bytes: Default::default(),
+            })
         }
     }
 
@@ -321,8 +393,7 @@ impl NonAbsentCommitVotes {
         };
 
         if !vote.verified {
-            let len = vote.signed_vote.sign_bytes_into(&mut self.sign_bytes[..]).unwrap();
-            let sign_bytes = &self.sign_bytes[..len];
+            let sign_bytes = &self.sign_bytes.update(&vote.signed_vote);
             validator
                 .verify_signature::<V>(sign_bytes, vote.signed_vote.signature())
                 .map_err(|_| {

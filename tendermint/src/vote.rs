@@ -319,6 +319,11 @@ impl SignedVote {
             .map(|signature| Self::new(vote, chain_id, validator_address, signature))
     }
 
+    /// Return the canonical representation of the vote.
+    pub fn vote(&self) -> &CanonicalVote {
+        &self.vote
+    }
+
     /// Return the id of the validator that signed this vote.
     pub fn validator_id(&self) -> account::Id {
         self.validator_address
